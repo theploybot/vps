@@ -1,0 +1,53 @@
+# actions/ssh-setup/action.yml
+name: Setup SSH key & Connect (Ubuntu)
+description: "Write SSH key, add pinned known_hosts, and connect to VPS"
+
+inputs:
+  host:
+    description: "VPS hostname or IP"
+    required: true
+  user:
+    description: "SSH username"
+    required: true
+  private_key:
+    description: "OpenSSH private key contents"
+    required: true
+  known_hosts:
+    description: "Pinned SSH known_hosts entry/entries for the target host"
+    required: true
+  port:
+    description: "SSH port"
+    required: false
+    default: "22"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup SSH Key + known_hosts
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        # Private key
+        printf '%s' "${{ inputs.private_key }}" | tr -d '\r' > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+        # Pinned host keys
+        printf '%s\n' "${{ inputs.known_hosts }}" | tr -d '\r' > ~/.ssh/known_hosts
+        chmod 600 ~/.ssh/known_hosts
+
+    - name: Connect to VPS
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" \
+          "echo Connected to VPS: \$(hostname)"

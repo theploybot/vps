@@ -1,0 +1,105 @@
+name: Nginx Test & Reload (Docker Nginx)
+description: "Run nginx -t and nginx -s reload inside nginx container; rollback from .bak on failure."
+
+inputs:
+  host: { required: true }
+  user: { required: true }
+  port: { required: false, default: "22" }
+
+  nginx_container_name:
+    required: false
+    default: "nginx_proxy"
+
+  service_name:
+    required: true
+
+  remove_service:
+    required: false
+    default: "false"
+
+  redirect_non_www_domain:
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Test and reload nginx
+      uses: ./actions/ssh-run
+      with:
+        host: ${{ inputs.host }}
+        user: ${{ inputs.user }}
+        port: ${{ inputs.port }}
+        script: |
+          set -euo pipefail
+
+          NGINX_CONTAINER="${{ inputs.nginx_container_name }}"
+          SERVICE_NAME="${{ inputs.service_name }}"
+          REMOVE_SERVICE="${{ inputs.remove_service }}"
+          REDIRECT_NON_WWW_DOMAIN="${{ inputs.redirect_non_www_domain }}"
+
+          NGINX_SITES_DIR="/opt/nginx/sites-enabled"
+          CONFIG_FILE="$NGINX_SITES_DIR/service-$SERVICE_NAME.conf"
+
+          maybe_restore() {
+            local f="$1"
+            if sudo test -f "$f.bak"; then
+              echo "↩️ Restoring backup: $f.bak -> $f"
+              sudo mv -f "$f.bak" "$f"
+            fi
+          }
+
+          cleanup_bak() {
+            local f="$1"
+            if sudo test -f "$f.bak"; then
+              sudo rm -f "$f.bak"
+            fi
+          }
+
+          echo "🔍 Testing nginx config in container: $NGINX_CONTAINER"
+          if ! sudo docker exec "$NGINX_CONTAINER" nginx -t; then
+            echo "❌ nginx -t failed. Rolling back from backups..."
+
+            maybe_restore "$CONFIG_FILE"
+            if [ -n "$REDIRECT_NON_WWW_DOMAIN" ]; then
+              maybe_restore "$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
+            fi
+
+            echo "🔁 Re-testing after rollback..."
+            sudo docker exec "$NGINX_CONTAINER" nginx -t || {
+              echo "❌ Still failing after rollback. Manual fix required."
+              exit 1
+            }
+          fi
+
+          echo "🔄 Reloading nginx..."
+          if ! sudo docker exec "$NGINX_CONTAINER" nginx -s reload; then
+            echo "❌ Reload failed. Rolling back from backups..."
+
+            maybe_restore "$CONFIG_FILE"
+            if [ -n "$REDIRECT_NON_WWW_DOMAIN" ]; then
+              maybe_restore "$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
+            fi
+
+            echo "🔁 Re-testing and reloading after rollback..."
+            sudo docker exec "$NGINX_CONTAINER" nginx -t
+            sudo docker exec "$NGINX_CONTAINER" nginx -s reload || {
+              echo "❌ Reload still failing after rollback."
+              exit 1
+            }
+
+            echo "⚠️ Rolled back due to reload failure."
+            exit 1
+          fi
+
+          # On success, remove backups (commit the change)
+          cleanup_bak "$CONFIG_FILE"
+          if [ -n "$REDIRECT_NON_WWW_DOMAIN" ]; then
+            cleanup_bak "$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
+          fi
+
+          if [ "$REMOVE_SERVICE" = "true" ]; then
+            echo "✅ Nginx reloaded after removal of service '$SERVICE_NAME'"
+          else
+            echo "✅ Nginx reloaded with service '$SERVICE_NAME' configuration"
+          fi

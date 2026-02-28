@@ -1,0 +1,336 @@
+name: Nginx Write Config (Docker Nginx)
+description: "Create/update/remove nginx config files for a service (no reload). Creates .bak backups."
+
+inputs:
+  host:
+    required: true
+    description: "VPS hostname or IP"
+  user:
+    required: true
+    description: "SSH username"
+  port:
+    required: false
+    default: "22"
+    description: "SSH port"
+
+  service_name:
+    required: true
+    description: "Name of the service (used for config file naming)"
+  container_name:
+    required: true
+    description: "Name of the Docker container to proxy to"
+  container_port:
+    required: true
+    description: "Internal port the container is running on"
+
+  routing_type:
+    required: false
+    default: "subdomain"
+    description: "subdomain|path"
+  server_name:
+    required: false
+    default: ""
+    description: "Server name for subdomain routing (e.g. api.example.com)"
+  path_prefix:
+    required: false
+    default: ""
+    description: "Path prefix for path-based routing (e.g. /api)"
+  domain:
+    required: false
+    default: ""
+    description: "Domain for path-based routing (e.g. example.com)"
+
+  nginx_container_name:
+    required: false
+    default: "nginx_proxy"
+    description: "Name of the nginx container"
+
+  remove_service:
+    required: false
+    default: "false"
+    description: "true to remove the service configuration"
+
+  enable_ssl:
+    required: false
+    default: "false"
+    description: "true to generate HTTPS server block"
+  ssl_cert_path:
+    required: false
+    default: ""
+    description: "Path to SSL certificate file (container path)"
+  ssl_key_path:
+    required: false
+    default: ""
+    description: "Path to SSL private key file (container path)"
+
+  redirect_non_www_domain:
+    required: false
+    default: ""
+    description: "Non-www domain to redirect from (e.g. example.com -> www.example.com)"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Write/remove nginx config files on VPS
+      uses: ./actions/ssh-run
+      with:
+        host: ${{ inputs.host }}
+        user: ${{ inputs.user }}
+        port: ${{ inputs.port }}
+        script: |
+          set -euo pipefail
+
+          SERVICE_NAME="${{ inputs.service_name }}"
+          CONTAINER_NAME="${{ inputs.container_name }}"
+          CONTAINER_PORT="${{ inputs.container_port }}"
+          ROUTING_TYPE="${{ inputs.routing_type }}"
+          SERVER_NAME="${{ inputs.server_name }}"
+          PATH_PREFIX="${{ inputs.path_prefix }}"
+          DOMAIN="${{ inputs.domain }}"
+          NGINX_CONTAINER="${{ inputs.nginx_container_name }}"
+          REMOVE_SERVICE="${{ inputs.remove_service }}"
+          ENABLE_SSL="${{ inputs.enable_ssl }}"
+          SSL_CERT_PATH="${{ inputs.ssl_cert_path }}"
+          SSL_KEY_PATH="${{ inputs.ssl_key_path }}"
+          REDIRECT_NON_WWW_DOMAIN="${{ inputs.redirect_non_www_domain }}"
+
+          NGINX_SITES_DIR="/opt/nginx/sites-enabled"
+          CONFIG_FILE="$NGINX_SITES_DIR/service-$SERVICE_NAME.conf"
+
+          echo "🔧 Nginx write-config for service: $SERVICE_NAME"
+
+          if [ -z "$SERVICE_NAME" ] || [ -z "$CONTAINER_NAME" ] || [ -z "$CONTAINER_PORT" ]; then
+            echo "❌ Missing required: service_name, container_name, container_port"
+            exit 1
+          fi
+
+          # Ensure nginx container exists
+          if ! sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
+            echo "❌ Nginx container '$NGINX_CONTAINER' not running."
+            exit 1
+          fi
+
+          sudo mkdir -p "$NGINX_SITES_DIR"
+          sudo chmod 755 "$NGINX_SITES_DIR"
+
+          backup_file() {
+            local f="$1"
+            if sudo test -f "$f"; then
+              sudo cp "$f" "$f.bak"
+              echo "🧷 Backup created: $f.bak"
+            fi
+          }
+
+          # Handle removal (write-config just removes files + creates backups; reload is separate)
+          if [ "$REMOVE_SERVICE" = "true" ]; then
+            echo "🗑 Removing config for service: $SERVICE_NAME"
+            if sudo test -f "$CONFIG_FILE"; then
+              backup_file "$CONFIG_FILE"
+              sudo rm -f "$CONFIG_FILE"
+              echo "✅ Removed: $CONFIG_FILE"
+            else
+              echo "ℹ️ No config to remove: $CONFIG_FILE"
+            fi
+
+            if [ -n "$REDIRECT_NON_WWW_DOMAIN" ]; then
+              REDIRECT_CONFIG_FILE="$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
+              if sudo test -f "$REDIRECT_CONFIG_FILE"; then
+                backup_file "$REDIRECT_CONFIG_FILE"
+                sudo rm -f "$REDIRECT_CONFIG_FILE"
+                echo "✅ Removed: $REDIRECT_CONFIG_FILE"
+              else
+                echo "ℹ️ No redirect config to remove: $REDIRECT_CONFIG_FILE"
+              fi
+            fi
+
+            echo "✅ Removal done (no reload yet)."
+            exit 0
+          fi
+
+          # Routing validation
+          if [ "$ROUTING_TYPE" = "subdomain" ]; then
+            if [ -z "$SERVER_NAME" ]; then
+              echo "❌ server_name is required for subdomain routing"
+              exit 1
+            fi
+            FINAL_SERVER_NAME="$SERVER_NAME"
+            FINAL_LOCATION="/"
+            PROXY_PASS_PATH=""
+          elif [ "$ROUTING_TYPE" = "path" ]; then
+            if [ -z "$PATH_PREFIX" ] || [ -z "$DOMAIN" ]; then
+              echo "❌ path_prefix and domain are required for path routing"
+              exit 1
+            fi
+            FINAL_SERVER_NAME="$DOMAIN"
+            FINAL_LOCATION="$PATH_PREFIX"
+            PROXY_PASS_PATH="/"
+          else
+            echo "❌ Invalid routing_type: $ROUTING_TYPE"
+            exit 1
+          fi
+
+          # SSL gating: only generate SSL block if files exist on host
+          if [ "$ENABLE_SSL" = "true" ] && [ -n "$SSL_CERT_PATH" ] && [ -n "$SSL_KEY_PATH" ]; then
+            CERT_CHECK="$SSL_CERT_PATH"
+            KEY_CHECK="$SSL_KEY_PATH"
+
+            # If user passes container paths like /etc/nginx/letsencrypt/..., map to host
+            if [[ "$CERT_CHECK" == /etc/nginx/letsencrypt* ]]; then
+              CERT_CHECK="${CERT_CHECK/\/etc\/nginx\/letsencrypt/\/etc\/letsencrypt}"
+            fi
+            if [[ "$KEY_CHECK" == /etc/nginx/letsencrypt* ]]; then
+              KEY_CHECK="${KEY_CHECK/\/etc\/nginx\/letsencrypt/\/etc\/letsencrypt}"
+            fi
+
+            if ! sudo test -f "$CERT_CHECK"; then
+              echo "⚠️ SSL cert not found on host: $CERT_CHECK (disabling SSL block)"
+              ENABLE_SSL="false"
+            elif ! sudo test -f "$KEY_CHECK"; then
+              echo "⚠️ SSL key not found on host: $KEY_CHECK (disabling SSL block)"
+              ENABLE_SSL="false"
+            fi
+          else
+            ENABLE_SSL="false"
+          fi
+
+          echo "📝 Writing config: $CONFIG_FILE"
+          echo "   server_name: $FINAL_SERVER_NAME"
+          echo "   location: $FINAL_LOCATION"
+          echo "   upstream: $CONTAINER_NAME:$CONTAINER_PORT"
+          echo "   SSL enabled: $ENABLE_SSL"
+
+          backup_file "$CONFIG_FILE"
+
+          TMP="$(mktemp)"
+          cat > "$TMP" <<CONF
+          # Service: $SERVICE_NAME
+          server {
+              listen 80;
+              server_name $FINAL_SERVER_NAME;
+
+              add_header X-Frame-Options DENY;
+              add_header X-Content-Type-Options nosniff;
+              add_header X-XSS-Protection "1; mode=block";
+
+              location /.well-known/acme-challenge/ {
+                  root /var/www/acme-challenges;
+                  try_files \$uri =404;
+              }
+
+              location $FINAL_LOCATION {
+                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
+                  proxy_pass \$backend_upstream$PROXY_PASS_PATH;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_cache_bypass \$http_upgrade;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_send_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+          }
+          CONF
+
+          if [ "$ROUTING_TYPE" = "path" ]; then
+            cat >> "$TMP" <<CONF
+
+          # Path routing health endpoint convenience
+          server {
+              listen 80;
+              server_name $FINAL_SERVER_NAME;
+
+              location ${PATH_PREFIX}/health {
+                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
+                  proxy_pass \$backend_upstream/health;
+                  proxy_set_header Host \$host;
+                  access_log off;
+              }
+          }
+          CONF
+          fi
+
+          if [ "$ENABLE_SSL" = "true" ]; then
+            cat >> "$TMP" <<CONF
+
+          server {
+              listen 443 ssl;
+              http2 on;
+              server_name $FINAL_SERVER_NAME;
+
+              ssl_certificate $SSL_CERT_PATH;
+              ssl_certificate_key $SSL_KEY_PATH;
+              ssl_protocols TLSv1.2 TLSv1.3;
+
+              add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+              add_header X-Frame-Options DENY;
+              add_header X-Content-Type-Options nosniff;
+              add_header X-XSS-Protection "1; mode=block";
+
+              location /.well-known/acme-challenge/ {
+                  root /var/www/acme-challenges;
+                  try_files \$uri =404;
+              }
+
+              location $FINAL_LOCATION {
+                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
+                  proxy_pass \$backend_upstream$PROXY_PASS_PATH;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_cache_bypass \$http_upgrade;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_connect_timeout 60s;
+                  proxy_send_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+          }
+          CONF
+          fi
+
+          sudo install -m 0644 "$TMP" "$CONFIG_FILE"
+          rm -f "$TMP"
+          echo "✅ Written: $CONFIG_FILE"
+
+          # Optional redirect config
+          if [ -n "$REDIRECT_NON_WWW_DOMAIN" ] && [ "$ROUTING_TYPE" = "subdomain" ] && [ -n "$SERVER_NAME" ]; then
+            REDIRECT_CONFIG_FILE="$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
+            echo "🔀 Writing redirect config: $REDIRECT_CONFIG_FILE"
+            backup_file "$REDIRECT_CONFIG_FILE"
+
+            TMP2="$(mktemp)"
+            cat > "$TMP2" <<CONF
+          # Redirect from $REDIRECT_NON_WWW_DOMAIN to $SERVER_NAME
+          server {
+              listen 80;
+              server_name $REDIRECT_NON_WWW_DOMAIN;
+              return 301 http://$SERVER_NAME\$request_uri;
+          }
+          CONF
+
+            if [ "$ENABLE_SSL" = "true" ]; then
+              cat >> "$TMP2" <<CONF
+
+          server {
+              listen 443 ssl;
+              http2 on;
+              server_name $REDIRECT_NON_WWW_DOMAIN;
+
+              ssl_certificate $SSL_CERT_PATH;
+              ssl_certificate_key $SSL_KEY_PATH;
+
+              return 301 https://$SERVER_NAME\$request_uri;
+          }
+          CONF
+            fi
+
+            sudo install -m 0644 "$TMP2" "$REDIRECT_CONFIG_FILE"
+            rm -f "$TMP2"
+            echo "✅ Written: $REDIRECT_CONFIG_FILE"
+          fi

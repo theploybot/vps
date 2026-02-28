@@ -1,0 +1,38 @@
+name: SSH Run (Ubuntu)
+description: "Run a bash script on a remote VPS over SSH (expects ~/.ssh/id_rsa and ~/.ssh/known_hosts already set)"
+
+inputs:
+  host:
+    description: "VPS hostname or IP"
+    required: true
+  user:
+    description: "SSH username"
+    required: true
+  port:
+    description: "SSH port"
+    required: false
+    default: "22"
+  script:
+    description: "Bash script to run on the remote server"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run remote script
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Ensure SSH materials are present (set by ssh-setup)
+        test -f ~/.ssh/id_rsa || (echo "Missing ~/.ssh/id_rsa. Run ssh-setup first." >&2; exit 1)
+        test -f ~/.ssh/known_hosts || (echo "Missing ~/.ssh/known_hosts. Run ssh-setup first." >&2; exit 1)
+
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" 'bash -se' << 'REMOTE_EOF'
+        ${{ inputs.script }}
+        REMOTE_EOF
