@@ -72,7 +72,7 @@ runs:
   using: "composite"
   steps:
     - name: Write/remove nginx config files on VPS
-      uses: ./actions/ssh-run
+      uses: theploybot/vps/ssh-run@v0.0.1
       with:
         host: ${{ inputs.host }}
         user: ${{ inputs.user }}
