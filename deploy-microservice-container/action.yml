@@ -1,0 +1,130 @@
+name: Deploy Microservice Docker Container to VPS
+description: "Transfer Docker image archive to VPS, load it, deploy container, and optionally run a health check."
+
+inputs:
+  host:
+    description: "VPS hostname or IP"
+    required: true
+  user:
+    description: "SSH username"
+    required: true
+  port:
+    description: "SSH port"
+    required: false
+    default: "22"
+
+  image_archive:
+    description: "Local path to Docker image archive (e.g. backend_api.tar)"
+    required: true
+  image_ref:
+    description: "Docker image reference to run after load (e.g. backend_api:latest)"
+    required: true
+
+  container_name:
+    description: "Name for the Docker container"
+    required: true
+  network_name:
+    description: "Docker network name shared with nginx"
+    required: false
+    default: "proxy_net"
+
+  docker_run_args:
+    description: "Additional arguments for docker run"
+    required: false
+    default: ""
+
+  container_command:
+    description: "Command to run inside container"
+    required: true
+
+  remote_images_dir:
+    description: "Directory on VPS for image archives"
+    required: false
+    default: "~/docker-images"
+
+  health_check_cmd:
+    description: "Optional shell command to run on VPS to verify deployment"
+    required: false
+    default: ""
+
+  health_check_timeout:
+    description: "Health check timeout in seconds"
+    required: false
+    default: "60"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure bundled scripts exist
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -f "${{ github.action_path }}/01-transfer-image.sh"
+        test -f "${{ github.action_path }}/02-load-image.sh"
+        test -f "${{ github.action_path }}/03-deploy-container.sh"
+        test -f "${{ github.action_path }}/04-health-check.sh"
+
+    - name: Create remote image directory
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat "${{ github.action_path }}/01-transfer-image.sh" | \
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" \
+          "REMOTE_IMAGES_DIR='${{ inputs.remote_images_dir }}' bash -se"
+
+    - name: Transfer Docker image archive to VPS
+      shell: bash
+      run: |
+        set -euo pipefail
+        scp -i ~/.ssh/id_rsa -P "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          "${{ inputs.image_archive }}" \
+          "${{ inputs.user }}@${{ inputs.host }}:${{ inputs.remote_images_dir }}/"
+
+    - name: Load Docker image on VPS
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCHIVE_BASENAME="$(basename '${{ inputs.image_archive }}')"
+        cat "${{ github.action_path }}/02-load-image.sh" | \
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" \
+          "REMOTE_IMAGES_DIR='${{ inputs.remote_images_dir }}' ARCHIVE_BASENAME='${ARCHIVE_BASENAME}' IMAGE_REF='${{ inputs.image_ref }}' bash -se"
+
+    - name: Deploy Docker container on VPS
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat "${{ github.action_path }}/03-deploy-container.sh" | \
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" \
+          "IMAGE_REF='${{ inputs.image_ref }}' CONTAINER_NAME='${{ inputs.container_name }}' NETWORK_NAME='${{ inputs.network_name }}' DOCKER_RUN_ARGS='${{ inputs.docker_run_args }}' CONTAINER_COMMAND='${{ inputs.container_command }}' bash -se"
+
+    - name: Run optional health check on VPS
+      if: ${{ inputs.health_check_cmd != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat "${{ github.action_path }}/04-health-check.sh" | \
+        ssh -i ~/.ssh/id_rsa -p "${{ inputs.port }}" \
+          -o StrictHostKeyChecking=yes \
+          -o UserKnownHostsFile=~/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o LogLevel=ERROR \
+          "${{ inputs.user }}@${{ inputs.host }}" \
+          "HEALTH_CHECK_CMD='${{ inputs.health_check_cmd }}' HEALTH_CHECK_TIMEOUT='${{ inputs.health_check_timeout }}' CONTAINER_NAME='${{ inputs.container_name }}' bash -se"
