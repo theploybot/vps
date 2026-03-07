@@ -41,7 +41,6 @@ inputs:
     required: false
     default: "/var/www/acme-challenges"
 
-  # Optional: mount Let's Encrypt certs from host so nginx can read them
   mount_letsencrypt:
     description: "true|false - mount /etc/letsencrypt into container (read-only)"
     required: false
@@ -55,7 +54,6 @@ inputs:
     required: false
     default: "/etc/letsencrypt"
 
-  # Optional: mount a custom cert directory (recommended if you use /opt/nginx/certs)
   mount_certs:
     description: "true|false - mount a host certs directory into container (read-only)"
     required: false
@@ -104,17 +102,14 @@ runs:
           echo "   Mount letsencrypt: $MOUNT_LE"
           echo "   Mount certs dir:   $MOUNT_CERTS"
 
-          # Ensure docker exists
           if ! command -v docker >/dev/null 2>&1; then
-            echo "❌ Docker is not installed. Run your docker install/provision step first."
+            echo "❌ Docker is not installed. Run docker setup first."
             exit 1
           fi
 
-          # Ensure dirs exist
           sudo mkdir -p "$SITES_DIR" "$ACME_DIR"
           sudo chmod 755 "$SITES_DIR" "$ACME_DIR"
 
-          # Ensure a default config exists so nginx can start even before any service is configured
           DEFAULT_CONF="$SITES_DIR/00-default.conf"
           if ! sudo test -f "$DEFAULT_CONF"; then
             echo "📝 Creating default nginx config at $DEFAULT_CONF"
@@ -133,8 +128,107 @@ runs:
           CONF
           fi
 
-          # Optional mounts
+          if [ "$MOUNT_CERTS" = "true" ]; then
+            sudo mkdir -p "$CERTS_HOST"
+            sudo chmod 755 "$CERTS_HOST"
+          fi
+
+          need_recreate="false"
+
+          container_exists="false"
+          container_running="false"
+
+          if sudo docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
+            container_exists="true"
+          fi
+
+          if sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
+            container_running="true"
+          fi
+
+          check_mount() {
+            local source="$1"
+            local destination="$2"
+            sudo docker inspect "$NGINX_CONTAINER" \
+              --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' \
+              | grep -Fq "$source -> $destination"
+          }
+
+          check_port() {
+            local port="$1"
+            sudo docker port "$NGINX_CONTAINER" 2>/dev/null | grep -q "^${port}/tcp ->"
+          }
+
+          check_image() {
+            local expected="$1"
+            local actual
+            actual="$(sudo docker inspect "$NGINX_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
+            [ "$actual" = "$expected" ]
+          }
+
+          if [ "$container_exists" = "true" ]; then
+            echo "🔍 Existing nginx container found, validating configuration..."
+
+            if ! check_image "$IMAGE"; then
+              echo "♻️ Image differs, will recreate"
+              need_recreate="true"
+            fi
+
+            if ! check_port 80; then
+              echo "♻️ HTTP port mapping missing, will recreate"
+              need_recreate="true"
+            fi
+
+            if ! check_port 443; then
+              echo "♻️ HTTPS port mapping missing, will recreate"
+              need_recreate="true"
+            fi
+
+            if ! check_mount "$SITES_DIR" "/etc/nginx/conf.d"; then
+              echo "♻️ Sites mount missing, will recreate"
+              need_recreate="true"
+            fi
+
+            if ! check_mount "$ACME_DIR" "/var/www/acme-challenges"; then
+              echo "♻️ ACME mount missing, will recreate"
+              need_recreate="true"
+            fi
+
+            if [ "$MOUNT_LE" = "true" ]; then
+              if ! check_mount "$LE_HOST" "$LE_CONT"; then
+                echo "♻️ Let's Encrypt mount missing, will recreate"
+                need_recreate="true"
+              fi
+            fi
+
+            if [ "$MOUNT_CERTS" = "true" ]; then
+              if ! check_mount "$CERTS_HOST" "$CERTS_CONT"; then
+                echo "♻️ Certs mount missing, will recreate"
+                need_recreate="true"
+              fi
+            fi
+          fi
+
+          if [ "$container_exists" = "true" ] && [ "$need_recreate" = "false" ]; then
+            if [ "$container_running" = "true" ]; then
+              echo "✅ Nginx container already running with correct configuration."
+              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+              exit 0
+            else
+              echo "▶️ Container exists with correct configuration but is stopped. Starting..."
+              sudo docker start "$NGINX_CONTAINER"
+              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+              exit 0
+            fi
+          fi
+
+          if [ "$container_exists" = "true" ] && [ "$need_recreate" = "true" ]; then
+            echo "🗑 Removing existing container so it can be recreated with correct mounts/ports..."
+            sudo docker rm -f "$NGINX_CONTAINER"
+          fi
+
           EXTRA_MOUNTS=()
+
           if [ "$MOUNT_LE" = "true" ]; then
             if sudo test -d "$LE_HOST"; then
               EXTRA_MOUNTS+=("-v" "$LE_HOST:$LE_CONT:ro")
@@ -144,23 +238,7 @@ runs:
           fi
 
           if [ "$MOUNT_CERTS" = "true" ]; then
-            sudo mkdir -p "$CERTS_HOST"
-            sudo chmod 755 "$CERTS_HOST"
             EXTRA_MOUNTS+=("-v" "$CERTS_HOST:$CERTS_CONT:ro")
-          fi
-
-          # If container exists but not running, start it
-          if sudo docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
-            if sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
-              echo "✅ Nginx container already running."
-              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-              exit 0
-            else
-              echo "▶️ Container exists but not running. Starting..."
-              sudo docker start "$NGINX_CONTAINER"
-              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-              exit 0
-            fi
           fi
 
           echo "🚀 Creating nginx proxy container..."
@@ -178,3 +256,6 @@ runs:
 
           echo "✅ Nginx proxy ready:"
           sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+          echo "📦 Active mounts:"
+          sudo docker inspect "$NGINX_CONTAINER" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
