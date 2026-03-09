@@ -104,7 +104,6 @@ runs:
             exit 1
           fi
 
-          # Ensure nginx container exists
           if ! sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
             echo "❌ Nginx container '$NGINX_CONTAINER' not running."
             exit 1
@@ -121,7 +120,6 @@ runs:
             fi
           }
 
-          # Handle removal (write-config just removes files + creates backups; reload is separate)
           if [ "$REMOVE_SERVICE" = "true" ]; then
             echo "🗑 Removing config for service: $SERVICE_NAME"
             if sudo test -f "$CONFIG_FILE"; then
@@ -147,7 +145,6 @@ runs:
             exit 0
           fi
 
-          # Routing validation
           if [ "$ROUTING_TYPE" = "subdomain" ]; then
             if [ -z "$SERVER_NAME" ]; then
               echo "❌ server_name is required for subdomain routing"
@@ -155,7 +152,8 @@ runs:
             fi
             FINAL_SERVER_NAME="$SERVER_NAME"
             FINAL_LOCATION="/"
-            PROXY_PASS_PATH=""
+            PROXY_PASS_URL="http://$CONTAINER_NAME:$CONTAINER_PORT"
+            HEALTH_PASS_URL="http://$CONTAINER_NAME:$CONTAINER_PORT/health"
           elif [ "$ROUTING_TYPE" = "path" ]; then
             if [ -z "$PATH_PREFIX" ] || [ -z "$DOMAIN" ]; then
               echo "❌ path_prefix and domain are required for path routing"
@@ -163,18 +161,17 @@ runs:
             fi
             FINAL_SERVER_NAME="$DOMAIN"
             FINAL_LOCATION="$PATH_PREFIX"
-            PROXY_PASS_PATH="/"
+            PROXY_PASS_URL="http://$CONTAINER_NAME:$CONTAINER_PORT/"
+            HEALTH_PASS_URL="http://$CONTAINER_NAME:$CONTAINER_PORT/health"
           else
             echo "❌ Invalid routing_type: $ROUTING_TYPE"
             exit 1
           fi
 
-          # SSL gating: only generate SSL block if files exist on host
           if [ "$ENABLE_SSL" = "true" ] && [ -n "$SSL_CERT_PATH" ] && [ -n "$SSL_KEY_PATH" ]; then
             CERT_CHECK="$SSL_CERT_PATH"
             KEY_CHECK="$SSL_KEY_PATH"
 
-            # If user passes container paths like /etc/nginx/letsencrypt/..., map to host
             if [[ "$CERT_CHECK" == /etc/nginx/letsencrypt* ]]; then
               CERT_CHECK="${CERT_CHECK/\/etc\/nginx\/letsencrypt/\/etc\/letsencrypt}"
             fi
@@ -196,7 +193,7 @@ runs:
           echo "📝 Writing config: $CONFIG_FILE"
           echo "   server_name: $FINAL_SERVER_NAME"
           echo "   location: $FINAL_LOCATION"
-          echo "   upstream: $CONTAINER_NAME:$CONTAINER_PORT"
+          echo "   upstream: $PROXY_PASS_URL"
           echo "   SSL enabled: $ENABLE_SSL"
 
           backup_file "$CONFIG_FILE"
@@ -218,8 +215,7 @@ runs:
               }
 
               location $FINAL_LOCATION {
-                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
-                  proxy_pass \$backend_upstream$PROXY_PASS_PATH;
+                  proxy_pass $PROXY_PASS_URL;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade \$http_upgrade;
                   proxy_set_header Connection 'upgrade';
@@ -244,8 +240,7 @@ runs:
               server_name $FINAL_SERVER_NAME;
 
               location ${PATH_PREFIX}/health {
-                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
-                  proxy_pass \$backend_upstream/health;
+                  proxy_pass $HEALTH_PASS_URL;
                   proxy_set_header Host \$host;
                   access_log off;
               }
@@ -276,8 +271,7 @@ runs:
               }
 
               location $FINAL_LOCATION {
-                  set \$backend_upstream http://$CONTAINER_NAME:$CONTAINER_PORT;
-                  proxy_pass \$backend_upstream$PROXY_PASS_PATH;
+                  proxy_pass $PROXY_PASS_URL;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade \$http_upgrade;
                   proxy_set_header Connection 'upgrade';
@@ -298,7 +292,6 @@ runs:
           rm -f "$TMP"
           echo "✅ Written: $CONFIG_FILE"
 
-          # Optional redirect config
           if [ -n "$REDIRECT_NON_WWW_DOMAIN" ] && [ "$ROUTING_TYPE" = "subdomain" ] && [ -n "$SERVER_NAME" ]; then
             REDIRECT_CONFIG_FILE="$NGINX_SITES_DIR/redirect-$REDIRECT_NON_WWW_DOMAIN.conf"
             echo "🔀 Writing redirect config: $REDIRECT_CONFIG_FILE"
