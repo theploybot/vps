@@ -1,5 +1,5 @@
 name: Setup Nginx Proxy (Docker)
-description: "Ensure nginx reverse proxy container is running with correct volume mounts for configs + ACME + optional certs"
+description: "Ensure nginx reverse proxy container is running with correct volume mounts, ports, and shared Docker network"
 
 inputs:
   host:
@@ -46,11 +46,11 @@ inputs:
     required: false
     default: "false"
   letsencrypt_host_dir:
-    description: "Host letsencrypt dir (usually /etc/letsencrypt)"
+    description: "Host letsencrypt dir"
     required: false
     default: "/etc/letsencrypt"
   letsencrypt_container_dir:
-    description: "Container letsencrypt dir (usually /etc/letsencrypt)"
+    description: "Container letsencrypt dir"
     required: false
     default: "/etc/letsencrypt"
 
@@ -66,6 +66,11 @@ inputs:
     description: "Container certs dir"
     required: false
     default: "/etc/nginx/certs"
+
+  network_name:
+    description: "Shared Docker network for nginx and app containers"
+    required: false
+    default: "proxy_net"
 
 runs:
   using: "composite"
@@ -94,6 +99,8 @@ runs:
           CERTS_HOST="${{ inputs.certs_host_dir }}"
           CERTS_CONT="${{ inputs.certs_container_dir }}"
 
+          NETWORK_NAME="${{ inputs.network_name }}"
+
           echo "🔧 Setting up nginx proxy container: $NGINX_CONTAINER"
           echo "   Image: $IMAGE"
           echo "   Ports: $HTTP_PORT -> 80, $HTTPS_PORT -> 443"
@@ -101,6 +108,7 @@ runs:
           echo "   ACME:  $ACME_DIR"
           echo "   Mount letsencrypt: $MOUNT_LE"
           echo "   Mount certs dir:   $MOUNT_CERTS"
+          echo "   Network: $NETWORK_NAME"
 
           if ! command -v docker >/dev/null 2>&1; then
             echo "❌ Docker is not installed. Run docker setup first."
@@ -109,6 +117,24 @@ runs:
 
           sudo mkdir -p "$SITES_DIR" "$ACME_DIR"
           sudo chmod 755 "$SITES_DIR" "$ACME_DIR"
+
+          if [ "$MOUNT_CERTS" = "true" ]; then
+            sudo mkdir -p "$CERTS_HOST"
+            sudo chmod 755 "$CERTS_HOST"
+          fi
+
+          if [ "$MOUNT_LE" = "true" ]; then
+            sudo mkdir -p "$LE_HOST"
+            sudo chmod 755 "$LE_HOST"
+          fi
+
+          # Ensure shared network exists
+          if ! sudo docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+            echo "🌐 Creating Docker network: $NETWORK_NAME"
+            sudo docker network create "$NETWORK_NAME"
+          else
+            echo "✅ Docker network already exists: $NETWORK_NAME"
+          fi
 
           DEFAULT_CONF="$SITES_DIR/00-default.conf"
           if ! sudo test -f "$DEFAULT_CONF"; then
@@ -126,24 +152,6 @@ runs:
               }
           }
           CONF
-          fi
-
-          if [ "$MOUNT_CERTS" = "true" ]; then
-            sudo mkdir -p "$CERTS_HOST"
-            sudo chmod 755 "$CERTS_HOST"
-          fi
-
-          need_recreate="false"
-
-          container_exists="false"
-          container_running="false"
-
-          if sudo docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
-            container_exists="true"
-          fi
-
-          if sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
-            container_running="true"
           fi
 
           check_mount() {
@@ -165,6 +173,24 @@ runs:
             actual="$(sudo docker inspect "$NGINX_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
             [ "$actual" = "$expected" ]
           }
+
+          check_network() {
+            sudo docker inspect "$NGINX_CONTAINER" \
+              --format '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' \
+              | grep -Fxq "$NETWORK_NAME"
+          }
+
+          need_recreate="false"
+          container_exists="false"
+          container_running="false"
+
+          if sudo docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
+            container_exists="true"
+          fi
+
+          if sudo docker ps --format '{{.Names}}' | grep -q "^${NGINX_CONTAINER}$"; then
+            container_running="true"
+          fi
 
           if [ "$container_exists" = "true" ]; then
             echo "🔍 Existing nginx container found, validating configuration..."
@@ -194,47 +220,45 @@ runs:
               need_recreate="true"
             fi
 
-            if [ "$MOUNT_LE" = "true" ]; then
-              if ! check_mount "$LE_HOST" "$LE_CONT"; then
-                echo "♻️ Let's Encrypt mount missing, will recreate"
-                need_recreate="true"
-              fi
+            if [ "$MOUNT_LE" = "true" ] && ! check_mount "$LE_HOST" "$LE_CONT"; then
+              echo "♻️ Let's Encrypt mount missing, will recreate"
+              need_recreate="true"
             fi
 
-            if [ "$MOUNT_CERTS" = "true" ]; then
-              if ! check_mount "$CERTS_HOST" "$CERTS_CONT"; then
-                echo "♻️ Certs mount missing, will recreate"
-                need_recreate="true"
-              fi
+            if [ "$MOUNT_CERTS" = "true" ] && ! check_mount "$CERTS_HOST" "$CERTS_CONT"; then
+              echo "♻️ Certs mount missing, will recreate"
+              need_recreate="true"
             fi
           fi
 
           if [ "$container_exists" = "true" ] && [ "$need_recreate" = "false" ]; then
-            if [ "$container_running" = "true" ]; then
-              echo "✅ Nginx container already running with correct configuration."
-              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-              exit 0
-            else
+            if [ "$container_running" = "false" ]; then
               echo "▶️ Container exists with correct configuration but is stopped. Starting..."
               sudo docker start "$NGINX_CONTAINER"
-              sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-              exit 0
             fi
+
+            # Ensure nginx is attached to the shared network
+            if ! check_network; then
+              echo "🔗 Connecting nginx container to network: $NETWORK_NAME"
+              sudo docker network connect "$NETWORK_NAME" "$NGINX_CONTAINER"
+            fi
+
+            echo "✅ Nginx container already running with correct configuration."
+            sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "📦 Active networks:"
+            sudo docker inspect "$NGINX_CONTAINER" --format '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}'
+            exit 0
           fi
 
           if [ "$container_exists" = "true" ] && [ "$need_recreate" = "true" ]; then
-            echo "🗑 Removing existing container so it can be recreated with correct mounts/ports..."
+            echo "🗑 Removing existing container so it can be recreated with correct mounts/ports/network..."
             sudo docker rm -f "$NGINX_CONTAINER"
           fi
 
           EXTRA_MOUNTS=()
 
           if [ "$MOUNT_LE" = "true" ]; then
-            if sudo test -d "$LE_HOST"; then
-              EXTRA_MOUNTS+=("-v" "$LE_HOST:$LE_CONT:ro")
-            else
-              echo "⚠️ letsencrypt host dir not found: $LE_HOST (skipping mount)"
-            fi
+            EXTRA_MOUNTS+=("-v" "$LE_HOST:$LE_CONT:ro")
           fi
 
           if [ "$MOUNT_CERTS" = "true" ]; then
@@ -244,6 +268,7 @@ runs:
           echo "🚀 Creating nginx proxy container..."
           sudo docker run -d --name "$NGINX_CONTAINER" \
             --restart unless-stopped \
+            --network "$NETWORK_NAME" \
             -p "$HTTP_PORT:80" \
             -p "$HTTPS_PORT:443" \
             -v "$SITES_DIR:/etc/nginx/conf.d:ro" \
@@ -259,3 +284,6 @@ runs:
 
           echo "📦 Active mounts:"
           sudo docker inspect "$NGINX_CONTAINER" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+
+          echo "🌐 Active networks:"
+          sudo docker inspect "$NGINX_CONTAINER" --format '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}'

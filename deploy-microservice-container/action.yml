@@ -40,7 +40,7 @@ inputs:
   remote_images_dir:
     description: "Directory on VPS for image archives"
     required: false
-    default: "~/docker-images"
+    default: "/home/deploy/docker-images"
 
   health_check_cmd:
     description: "Optional shell command to run on VPS to verify deployment"
