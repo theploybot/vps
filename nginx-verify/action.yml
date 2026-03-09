@@ -1,5 +1,5 @@
 name: Nginx Verify (Docker Nginx)
-description: "Verify nginx config presence and container status/logs."
+description: "Verify nginx config presence, container status/logs, test nginx config, and optionally reload nginx."
 
 inputs:
   host: { required: true }
@@ -17,6 +17,10 @@ inputs:
     required: false
     default: "false"
 
+  reload_nginx:
+    required: false
+    default: "true"
+
 runs:
   using: "composite"
   steps:
@@ -32,6 +36,7 @@ runs:
           NGINX_CONTAINER="${{ inputs.nginx_container_name }}"
           SERVICE_NAME="${{ inputs.service_name }}"
           REMOVE_SERVICE="${{ inputs.remove_service }}"
+          RELOAD_NGINX="${{ inputs.reload_nginx }}"
 
           CONFIG_FILE="/opt/nginx/sites-enabled/service-$SERVICE_NAME.conf"
 
@@ -55,6 +60,29 @@ runs:
           echo ""
           echo "📦 Nginx container status:"
           sudo docker ps --filter "name=$NGINX_CONTAINER" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+
+          echo ""
+          echo "🧪 Testing nginx configuration inside container:"
+          if sudo docker exec "$NGINX_CONTAINER" nginx -t; then
+            echo "✅ nginx -t passed"
+          else
+            echo "❌ nginx -t failed"
+            exit 1
+          fi
+
+          if [ "$RELOAD_NGINX" = "true" ]; then
+            echo ""
+            echo "🔄 Reloading nginx..."
+            if sudo docker exec "$NGINX_CONTAINER" nginx -s reload; then
+              echo "✅ nginx reloaded successfully"
+            else
+              echo "❌ nginx reload failed"
+              exit 1
+            fi
+          else
+            echo ""
+            echo "ℹ️ Skipping nginx reload (reload_nginx=false)"
+          fi
 
           echo ""
           echo "📝 Recent nginx logs:"
